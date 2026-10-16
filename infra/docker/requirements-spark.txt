@@ -1,0 +1,12 @@
+# Dùng chung cho image Spark và Airflow để driver và executor cùng phiên bản thư viện
+pyspark==3.5.3
+delta-spark==3.2.1
+apache-sedona==1.6.1
+shapely==2.0.6
+h3==4.1.2
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==17.0.0
+scikit-learn==1.5.2
+boto3==1.35.36
+confluent-kafka==2.6.1
