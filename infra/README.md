@@ -37,12 +37,12 @@ Toàn bộ hạ tầng chạy bằng Docker Compose trên một máy. Chia thàn
 | Lõi + serving | 11 GB |
 | Tất cả | 15–16 GB |
 
-- **Windows:** Docker Desktop dùng WSL2, mặc định chỉ lấy một phần RAM. Tạo file `%UserProfile%\.wslconfig`:
+- **Windows:** Docker chạy trong WSL2, mà WSL2 mặc định chỉ lấy một phần RAM của máy. Tạo file `%UserProfile%\.wslconfig`:
   ```
   [wsl2]
   memory=12GB
   ```
-  rồi chạy `wsl --shutdown` và mở lại Docker Desktop.
+  rồi chạy `wsl --shutdown` trong PowerShell và mở lại Ubuntu.
 - **Linux:** Elasticsearch cần `sudo sysctl -w vm.max_map_count=262144`.
 
 ## Khởi động nhanh
@@ -55,7 +55,7 @@ make up-core      # MinIO + Spark
 make smoke        # kiểm tra Spark + MinIO + Delta + Sedona
 ```
 
-Không có `make` (Windows không dùng WSL): xem lệnh tương ứng trong `Makefile`, ví dụ `make up-core` = `docker compose up -d`.
+**Windows:** chạy trong Ubuntu (WSL2), ở đó có sẵn `make`.
 
 Smoke test thành công sẽ in ra:
 

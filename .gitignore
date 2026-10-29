@@ -1,8 +1,24 @@
-# Dữ liệu và bí mật không đưa lên Git
+# ---- Dữ liệu và bí mật: KHÔNG BAO GIỜ commit ----
 data/
 infra/.env
 *.sql
 *.sql.zst
+*.sql.gz
 *.parquet
+*.osm.pbf
+osrm/
+
+# ---- Sinh ra khi chạy ----
+out/
 __pycache__/
+*.pyc
 .ipynb_checkpoints/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# ---- Môi trường cá nhân ----
+.venv/
+.vscode/
+.idea/
+.DS_Store
