@@ -6,6 +6,7 @@
 | `jobs/ingest/to_silver.py` | Bronze → Silver (tách điểm, ẩn danh, sửa giờ, bỏ trùng, bỏ điểm lỗi) | container `spark-client` |
 | `jobs/ingest/export_sample.py` | Silver → bộ mẫu Parquet cho nhóm | container `spark-client` |
 | `scripts/generate_fake_dump.py` | Sinh dữ liệu giả lập đúng định dạng dump | máy (Ubuntu/WSL), chỉ cần Python |
+| `scripts/load_chunks.sh` | Nạp file dump lớn theo từng phần vào Bronze | máy (Ubuntu/WSL), gốc repo |
 
 Các lệnh `docker compose` chạy trong thư mục `infra/`. Các lệnh `python3` chạy ở **gốc repo**.
 
@@ -102,9 +103,76 @@ SELECT * FROM read_parquet('data/samples/points_2026-10-11_1d/*.parquet');
 ```
 Thêm `--days 30 --vehicles 100` để xuất mẫu 1 tháng, 100 xe.
 
+## Nạp file dump lớn (hàng chục GB)
+
+Không nạp cả file một lần: cắt thành các phần ~1 GB, nén `.gz`, nạp lần lượt.
+
+**1. Cắt và nén** (đọc file gốc một lượt, ghi thẳng ra file nén, không tốn thêm chỗ cho bản chưa nén):
+```bash
+SRC="/mnt/c/duong/dan/toi/dump.sql"        # nhiều file: SRC="/mnt/c/.../*.sql"
+mkdir -p data/raw/chunks
+grep -h '^INSERT INTO' $SRC \
+  | split -C 1G -d -a 3 --additional-suffix=.sql --filter='gzip -6 > "$FILE.gz"' - data/raw/chunks/part_
+```
+
+**2. Kiểm tra không mất dòng** – hai số phải bằng nhau:
+```bash
+grep -h -c '^INSERT INTO' $SRC | awk '{s+=$1} END {print s}'
+zcat data/raw/chunks/*.sql.gz | wc -l
+```
+
+**3. Nạp Bronze** (chế độ `append`, tự bỏ qua phần đã nạp):
+```bash
+bash scripts/load_chunks.sh
+```
+
+**4. Gộp file nhỏ** (mỗi phần sinh vài file cho mỗi ngày, gộp lại cho các bước sau đọc nhanh):
+```bash
+docker compose -f infra/docker-compose.yml exec -T spark-client python3 - <<'PY'
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.appName("optimize-bronze").getOrCreate()
+spark.sql("OPTIMIZE delta.`s3a://gps/bronze/hourly`").show(truncate=False)
+PY
+```
+
+**5. Xem dữ liệu có bao nhiêu xe, khoảng ngày nào** (chỉ đọc vài cột nhỏ, rất nhanh):
+```bash
+docker compose -f infra/docker-compose.yml exec -T spark-client python3 - <<'PY'
+from pyspark.sql import SparkSession, functions as F
+spark = SparkSession.builder.appName("bronze-summary").getOrCreate()
+b = spark.read.format("delta").load("s3a://gps/bronze/hourly")
+b.agg(F.countDistinct("vehicle_code").alias("so_xe"), F.min("date").alias("tu_ngay"),
+      F.max("date").alias("den_ngay"), F.sum("total").alias("tong_diem")).show()
+b.groupBy(F.date_format("date", "yyyy-MM").alias("thang")).agg(F.sum("total").alias("diem")).orderBy("thang").show(24)
+PY
+```
+
+**6. Làm sạch theo từng tháng** (thay `START` và `MONTHS` theo kết quả bước 5):
+```bash
+START=2025-11-01; MONTHS=12
+for k in $(seq 0 $((MONTHS - 1))); do
+  s=$(date -d "$START +$k month" +%F); e=$(date -d "$s +1 month -1 day" +%F)
+  echo "== $s -> $e"
+  docker compose -f infra/docker-compose.yml exec -T spark-client \
+    spark-submit /opt/jobs/ingest/to_silver.py --date-from "$s" --date-to "$e" | grep -E "Điểm|KHỚP"
+done
+```
+Silver dùng chế độ ghi đè theo ngày, tháng nào lỗi thì chạy lại riêng tháng đó.
+
+**Nếu một phần bị lỗi giữa chừng:** Delta ghi theo giao dịch nên thường phần lỗi chưa ghi gì. Trước khi chạy lại, kiểm tra cho chắc (thay tên phần):
+```bash
+docker compose -f infra/docker-compose.yml exec -T spark-client python3 - <<'PY'
+from pyspark.sql import SparkSession, functions as F
+spark = SparkSession.builder.getOrCreate()
+print(spark.read.format("delta").load("s3a://gps/bronze/hourly")
+      .where(F.col("source_file").endswith("part_007.sql.gz")).count())
+PY
+```
+Ra `0` thì chạy lại `bash scripts/load_chunks.sh` bình thường. Khác `0` (đã lỡ ghi) thì thêm tên phần vào `data/raw/chunks/_loaded.txt` để bỏ qua.
+
 ## Lưu ý
 
-- Mọi job ghi theo kiểu chỉ thay đúng các ngày đang xử lý, **chạy lại bao nhiêu lần cũng không tạo trùng** (riêng thư mục quarantine được ghi nối thêm).
+- Mặc định các job chỉ ghi đè đúng các ngày đang xử lý, **chạy lại không tạo trùng**. Ngoại lệ: `to_bronze.py --mode append` (nạp theo từng phần) và thư mục quarantine được ghi nối thêm.
 - Với `--date D`, `to_silver.py` đọc Bronze của cả ngày D và D+1, vì điểm cuối ngày D có thể nằm trong dòng giờ 00 của ngày D+1 (ví dụ `t0` = 23:59:59, `t1` = 00:00:06 hôm sau).
 - Giờ được hiểu là giờ Việt Nam (`spark.sql.session.timeZone = Asia/Ho_Chi_Minh` trong `spark-defaults.conf`) – **cần xác nhận lại với bên cung cấp**.
 - Mặc định ghi Delta trên MinIO. Thử nhanh không cần MinIO: thêm `--format parquet --output /data/tmp/...`.
