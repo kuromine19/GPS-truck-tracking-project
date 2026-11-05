@@ -1,0 +1,105 @@
+# CI/CD cho đồ án GPS xe tải
+#
+# - Mọi Pull Request và mọi lần push lên main: chạy kiểm thử trên máy của GitHub (job "test").
+# - Push/merge vào main và kiểm thử đạt: runner trên máy chủ nhóm tự cập nhật (job "deploy").
+#
+# Cần cấu hình một lần (xem docs/cicd.md):
+#   - Self-hosted runner trên máy chủ, gắn nhãn "gps-server"
+#   - Biến repo (Settings → Secrets and variables → Actions → Variables):
+#       DEPLOY_DIR       thư mục repo trên máy chủ, ví dụ /home/ubuntu/gps
+#       DEPLOY_PROFILES  các profile đang chạy, ví dụ "--profile streaming --profile orchestration"
+#                        (để trống = chỉ phần lõi MinIO + Spark)
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Kiểm thử
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cài PySpark
+        run: pip install pyspark==3.5.3
+
+      - name: Kiểm tra cú pháp Python
+        run: python -m py_compile $(git ls-files '*.py')
+
+      - name: Kiểm tra cú pháp shell script
+        run: for f in $(git ls-files '*.sh'); do bash -n "$f"; done
+
+      - name: Kiểm tra docker-compose hợp lệ
+        run: |
+          cp infra/.env.example infra/.env
+          docker compose -f infra/docker-compose.yml \
+            --profile streaming --profile serving --profile orchestration config --quiet
+
+      - name: Chạy thử ingestion trên dữ liệu giả lập
+        run: bash tests/test_ingest_pipeline.sh
+
+  deploy:
+    name: Triển khai lên máy chủ
+    needs: test
+    # Chưa có máy chủ (chưa đặt biến DEPLOY_DIR) thì bỏ qua bước triển khai
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_DIR != ''
+    runs-on: [self-hosted, gps-server]
+    timeout-minutes: 60
+    concurrency:
+      group: deploy-gps-server
+      cancel-in-progress: false
+    env:
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+      DEPLOY_PROFILES: ${{ vars.DEPLOY_PROFILES }}
+    steps:
+      - name: Cập nhật code trên máy chủ
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_DIR" || { echo "Chưa đặt biến DEPLOY_DIR"; exit 1; }
+          cd "$DEPLOY_DIR"
+          OLD=$(git rev-parse HEAD)
+          git fetch --quiet origin main
+          # reset --hard KHÔNG đụng tới file bị .gitignore (infra/.env, data/)
+          git reset --hard origin/main
+          NEW=$(git rev-parse HEAD)
+          git diff --name-only "$OLD" "$NEW" > "$RUNNER_TEMP/changed.txt"
+          echo "Các file thay đổi ($OLD -> $NEW):"
+          cat "$RUNNER_TEMP/changed.txt"
+
+      - name: Nhắc cập nhật .env nếu file mẫu thay đổi
+        run: |
+          if grep -qx 'infra/.env.example' "$RUNNER_TEMP/changed.txt"; then
+            echo "::warning::infra/.env.example đã thay đổi – kiểm tra và bổ sung biến mới vào infra/.env trên máy chủ"
+          fi
+
+      - name: Build và khởi động lại hạ tầng (chỉ khi infra/ thay đổi)
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_DIR/infra"
+          if grep -q '^infra/' "$RUNNER_TEMP/changed.txt"; then
+            docker compose $DEPLOY_PROFILES build
+            docker compose $DEPLOY_PROFILES up -d
+          else
+            echo "Hạ tầng không đổi. jobs/ và dags/ được mount trực tiếp vào container nên đã có hiệu lực ngay."
+          fi
+
+      - name: Smoke test
+        run: |
+          cd "$DEPLOY_DIR/infra"
+          docker compose exec -T spark-client spark-submit /opt/infra/scripts/smoke_test.py

@@ -10,8 +10,13 @@ Tham số:
     --output      nơi ghi Bronze               (mặc định s3a://gps/bronze/hourly)
     --quarantine  nơi ghi dòng INSERT lỗi      (mặc định s3a://gps/quarantine/bronze_unparsed)
     --format      delta | parquet              (mặc định delta)
+    --mode        overwrite | append           (mặc định overwrite)
 
-Chạy lại bao nhiêu lần cũng không tạo trùng: chỉ ghi đè đúng các ngày có trong file đầu vào.
+  overwrite: ghi đè đúng các ngày có trong đầu vào -> chạy lại không tạo trùng.
+             Dùng khi đầu vào chứa TRỌN dữ liệu của các ngày đó (VD: cả bộ dump trong một lần chạy).
+  append   : ghi nối thêm. Dùng khi nạp file dump lớn theo từng phần (chunk): mỗi phần chứa một
+             nhóm xe nhưng nhiều ngày, nếu overwrite thì phần sau sẽ XÓA dữ liệu cùng ngày của phần trước.
+             Mỗi phần chỉ được nạp MỘT lần (scripts/load_chunks.sh tự ghi nhớ phần đã nạp).
 """
 import argparse
 
@@ -32,6 +37,7 @@ def parse_args():
     ap.add_argument("--output", default="s3a://gps/bronze/hourly")
     ap.add_argument("--quarantine", default="s3a://gps/quarantine/bronze_unparsed")
     ap.add_argument("--format", default="delta", choices=["delta", "parquet"])
+    ap.add_argument("--mode", default="overwrite", choices=["overwrite", "append"])
     return ap.parse_args()
 
 
@@ -70,12 +76,12 @@ def main():
         F.current_timestamp().alias("ingested_at"),
     )
 
-    (bronze.repartition("date")
-        .write.format(args.format)
-        .mode("overwrite")
-        .option("partitionOverwriteMode", "dynamic")
-        .partitionBy("date")
-        .save(args.output))
+    writer = bronze.repartition("date").write.format(args.format).partitionBy("date")
+    if args.mode == "overwrite":
+        writer = writer.mode("overwrite").option("partitionOverwriteMode", "dynamic")
+    else:
+        writer = writer.mode("append")
+    writer.save(args.output)
 
     n_bad = bad.count()
     if n_bad:
@@ -103,7 +109,7 @@ def main():
     print(f"  Tổng điểm theo cột Total : {summary['expected_points'] or 0:,}")
     if summary["name_mismatch"]:
         print(f"  CẢNH BÁO: {summary['name_mismatch']:,} dòng có tên bảng khác VehicleCode")
-    print(f"  Ghi tại                  : {args.output}")
+    print(f"  Ghi tại                  : {args.output} (mode={args.mode})")
     print("=" * 60)
 
     parsed.unpersist()

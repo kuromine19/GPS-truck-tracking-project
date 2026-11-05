@@ -1,0 +1,28 @@
+{
+  "name": "GPS truck big data",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.10-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/java:1": { "version": "17" }
+  },
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "32gb"
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "forwardPorts": [9001, 18080, 4040, 8082, 5601, 8088],
+  "portsAttributes": {
+    "9001": { "label": "MinIO Console" },
+    "18080": { "label": "Spark Master UI" },
+    "4040": { "label": "Spark App UI" },
+    "8082": { "label": "Kafka UI" },
+    "5601": { "label": "Kibana" },
+    "8088": { "label": "Airflow" }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "ms-azuretools.vscode-docker"]
+    }
+  }
+}

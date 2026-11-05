@@ -12,9 +12,11 @@ Các bước:
 Chạy:
     spark-submit /opt/jobs/ingest/to_silver.py                     # toàn bộ Bronze
     spark-submit /opt/jobs/ingest/to_silver.py --date 2026-10-11   # 1 ngày
+    spark-submit /opt/jobs/ingest/to_silver.py --date-from 2026-01-01 --date-to 2026-01-31   # 1 khoảng ngày
 
 Lưu ý: điểm của ngày D có thể nằm trong dòng Bronze của giờ 00 ngày D+1
-(VD t0 = 23:59:59, t1 = 00:00:06). Vì vậy với --date D, job đọc Bronze của cả D và D+1.
+(VD t0 = 23:59:59, t1 = 00:00:06). Vì vậy với khoảng [từ, đến], job đọc Bronze đến hết ngày "đến"+1,
+rồi chỉ ghi các điểm có ngày nằm trong khoảng.
 """
 import argparse
 import os
@@ -48,7 +50,9 @@ def parse_args():
     ap.add_argument("--output", default="s3a://gps/silver/points")
     ap.add_argument("--quarantine", default="s3a://gps/quarantine/silver_rejected")
     ap.add_argument("--format", default="delta", choices=["delta", "parquet"])
-    ap.add_argument("--date", help="YYYY-MM-DD; bỏ trống = xử lý toàn bộ")
+    ap.add_argument("--date", help="YYYY-MM-DD: xử lý 1 ngày (bỏ trống cả 3 tham số ngày = toàn bộ)")
+    ap.add_argument("--date-from", help="YYYY-MM-DD: ngày đầu của khoảng")
+    ap.add_argument("--date-to", help="YYYY-MM-DD: ngày cuối của khoảng (tính cả ngày này)")
     ap.add_argument("--salt", default=os.environ.get("VEHICLE_KEY_SALT", "gps-project"),
                     help="chuỗi bí mật để băm mã xe (đặt qua biến môi trường VEHICLE_KEY_SALT)")
     ap.add_argument("--dim-output", help="(tuỳ chọn) nơi ghi bảng vehicle_key <-> mã xe. "
@@ -82,10 +86,15 @@ def main():
     spark = SparkSession.builder.appName("ingest-to-silver").getOrCreate()
 
     bronze = spark.read.format(args.format).load(args.input)
-    run_date = None
+    d_from = d_to = None
     if args.date:
-        run_date = date.fromisoformat(args.date)
-        bronze = bronze.where(F.col("date").between(F.lit(run_date), F.lit(run_date + timedelta(days=1))))
+        d_from = d_to = date.fromisoformat(args.date)
+    elif args.date_from or args.date_to:
+        if not (args.date_from and args.date_to):
+            raise SystemExit("Cần cả --date-from và --date-to")
+        d_from, d_to = date.fromisoformat(args.date_from), date.fromisoformat(args.date_to)
+    if d_from:
+        bronze = bronze.where(F.col("date").between(F.lit(d_from), F.lit(d_to + timedelta(days=1))))
 
     # 1. Tách mảng
     withs = bronze.withColumn("arr", F.from_json(details_to_json_array(F.col("details_raw")), POINT_SCHEMA))
@@ -151,8 +160,8 @@ def main():
                .withColumn("date", F.to_date("gps_time"))
                .select("vehicle_key", "date", "gps_time", "recv_time", "lat", "lon", "speed",
                        "odometer", "status", "heading", "clock_fixed"))
-    if run_date:
-        silver = silver.where(F.col("date") == F.lit(run_date))
+    if d_from:
+        silver = silver.where(F.col("date").between(F.lit(d_from), F.lit(d_to)))
 
     (silver.repartition("date")
         .sortWithinPartitions("vehicle_key", "gps_time")
@@ -185,7 +194,7 @@ def main():
     by_reason = {r["reject_reason"]: r["count"] for r in rejected.groupBy("reject_reason").count().collect()}
 
     print("=" * 60)
-    print("SILVER – KẾT QUẢ" + (f" (ngày {run_date})" if run_date else ""))
+    print("SILVER – KẾT QUẢ" + (f" ({d_from} -> {d_to})" if d_from else ""))
     print(f"  Dòng Bronze không tách được : {bad_rows.count():,}")
     print(f"  Điểm theo cột Total         : {expected:,}")
     print(f"  Điểm tách được              : {exploded:,}"
