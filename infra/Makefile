@@ -1,7 +1,8 @@
 # Lệnh tắt cho hạ tầng. Chạy trong thư mục infra/.
 COMPOSE = docker compose
 
-.PHONY: env build up-core up-streaming up-serving up-orchestration up-all workers ps logs smoke smoke-kafka down clean
+.PHONY: env build up-core up-streaming up-serving up-orchestration up-all workers ps logs smoke smoke-kafka down clean \
+        es-setup replay-prepare produce stream
 
 env:            ## Tạo file .env từ mẫu (chỉ khi chưa có)
 	@test -f .env || (cp .env.example .env && echo 'Đã tạo .env, hãy đổi mật khẩu')
@@ -38,6 +39,24 @@ smoke:          ## Kiểm tra Spark + MinIO + Delta + Sedona
 
 smoke-kafka:    ## Kiểm tra thêm Kafka (cần up-streaming)
 	$(COMPOSE) exec spark-client spark-submit /opt/infra/scripts/smoke_test.py --kafka
+
+# ---- streaming
+DATE ?= 2022-07-05
+VEHICLES ?= 2000
+SPEEDUP ?= 60
+REPLAY ?= /data/replay/$(DATE)_$(DATE)_$(VEHICLES)xe
+
+es-setup:       ## Tạo index ES + data view Kibana
+	$(COMPOSE) exec spark-client python3 /opt/jobs/streaming/es_setup.py
+
+replay-prepare: ## Tạo dữ liệu phát lại từ Bronze
+	$(COMPOSE) exec spark-client spark-submit /opt/jobs/streaming/prepare_replay.py --date $(DATE) --vehicles $(VEHICLES)
+
+produce:        ## Phát lại vào Kafka
+	$(COMPOSE) exec spark-client python3 /opt/jobs/streaming/producer.py --replay $(REPLAY) --speedup $(SPEEDUP)
+
+stream:         ## Chạy Spark Streaming
+	$(COMPOSE) exec spark-client spark-submit /opt/jobs/streaming/stream_process.py
 
 down:           ## Tắt hết, GIỮ dữ liệu
 	$(COMPOSE) --profile streaming --profile serving --profile orchestration down
