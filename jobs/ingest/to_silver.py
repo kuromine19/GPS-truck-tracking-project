@@ -1,47 +1,21 @@
-"""SILVER – Tách mảng JSON trong Bronze thành từng điểm GPS và làm sạch.
+"""Bronze -> Silver: tách điểm GPS, ẩn danh, sửa giờ, cách ly lỗi, bỏ trùng, bỏ điểm nhảy.
 
-Các bước:
-  1. Tách mảng Details -> 1 dòng = 1 điểm GPS
-  2. Ẩn danh mã xe: vehicle_key = xxhash64(salt, mã xe)
-  3. Sửa giờ thiết bị sai: t0 lệch t1 quá ngưỡng -> lấy giờ server (t1), gắn cờ clock_fixed
-  4. Cách ly điểm lỗi: thiếu thời gian, tọa độ (0,0)/rỗng, ngoài Việt Nam, vận tốc bất thường
-  5. Bỏ bản ghi trùng (cùng xe, cùng gps_time) – giữ lần server nhận sớm nhất
-  6. Bỏ điểm "nhảy" (GPS jump): vận tốc suy ra từ điểm trước VÀ điểm sau đều > ngưỡng
-  7. Ghi Silver, chia thư mục theo ngày của gps_time
-
-Chạy:
-    spark-submit /opt/jobs/ingest/to_silver.py                     # toàn bộ Bronze
-    spark-submit /opt/jobs/ingest/to_silver.py --date 2026-10-11   # 1 ngày
-    spark-submit /opt/jobs/ingest/to_silver.py --date-from 2026-01-01 --date-to 2026-01-31   # 1 khoảng ngày
-
-Lưu ý: điểm của ngày D có thể nằm trong dòng Bronze của giờ 00 ngày D+1
-(VD t0 = 23:59:59, t1 = 00:00:06). Vì vậy với khoảng [từ, đến], job đọc Bronze đến hết ngày "đến"+1,
-rồi chỉ ghi các điểm có ngày nằm trong khoảng.
+    spark-submit /opt/jobs/ingest/to_silver.py --date 2022-07-05
+    spark-submit /opt/jobs/ingest/to_silver.py --date-from 2022-06-15 --date-to 2022-07-14
+Đọc thêm ngày D+1 vì điểm cuối ngày D có thể nằm ở giờ 00 ngày D+1.
 """
 import argparse
 import os
+import sys
 from datetime import date, timedelta
 
-from pyspark import StorageLevel
-from pyspark.sql import SparkSession, Window
-from pyspark.sql import functions as F
-from pyspark.sql import types as T
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pyspark import StorageLevel  # noqa: E402
+from pyspark.sql import SparkSession, Window  # noqa: E402
+from pyspark.sql import functions as F  # noqa: E402
 
-POINT_SCHEMA = T.ArrayType(T.StructType([
-    T.StructField("t0", T.StringType()),
-    T.StructField("t1", T.StringType()),
-    T.StructField("cb", T.StringType()),
-    T.StructField("lt", T.DoubleType()),
-    T.StructField("ln", T.DoubleType()),
-    T.StructField("st", T.IntegerType()),
-    T.StructField("ag", T.DoubleType()),
-    T.StructField("km", T.DoubleType()),
-    T.StructField("vl", T.DoubleType()),
-    T.StructField("de", T.StringType()),
-]))
-
-# Khung tọa độ Việt Nam (rộng một chút)
-LAT_MIN, LAT_MAX, LON_MIN, LON_MAX = 8.0, 23.5, 102.0, 110.0
+from common.gps_parse import (fix_clock, flatten_point, haversine_km, parse_points,  # noqa: E402
+                              reject_reason, vehicle_key)
 
 
 def parse_args():
@@ -57,28 +31,14 @@ def parse_args():
                     help="chuỗi bí mật để băm mã xe (đặt qua biến môi trường VEHICLE_KEY_SALT)")
     ap.add_argument("--dim-output", help="(tuỳ chọn) nơi ghi bảng vehicle_key <-> mã xe. "
                                          "Chứa biển số thật: chỉ ghi ra ổ cục bộ, không đưa lên Git")
-    ap.add_argument("--max-clock-skew-min", type=float, default=60,
-                    help="t0 lệch t1 quá số phút này thì coi giờ thiết bị sai")
+    ap.add_argument("--max-future-min", type=float, default=5,
+                    help="giờ thiết bị muộn hơn giờ server nhận quá số phút này -> coi là sai")
+    ap.add_argument("--max-late-hours", type=float, default=72,
+                    help="giờ thiết bị sớm hơn giờ server nhận quá số giờ này -> cách ly (stale_gps)")
     ap.add_argument("--max-speed", type=float, default=200, help="vận tốc ghi nhận tối đa hợp lệ (km/h)")
     ap.add_argument("--jump-speed", type=float, default=150,
                     help="vận tốc suy ra giữa 2 điểm vượt ngưỡng này thì nghi điểm nhảy (km/h)")
     return ap.parse_args()
-
-
-def details_to_json_array(col):
-    """Mảng PostgreSQL {"{\\"t0\\":...}","{...}"} -> mảng JSON chuẩn [{"t0":...},{...}]"""
-    s = F.regexp_replace(col, r'\\"', '"')
-    s = F.regexp_replace(s, r'^\{"', "[")
-    s = F.regexp_replace(s, r'"\}$', "]")
-    s = F.regexp_replace(s, r'\}","\{', "},{")
-    return F.when(F.trim(col) == "{}", F.lit("[]")).otherwise(s)
-
-
-def haversine_km(lat1, lon1, lat2, lon2):
-    r = F.radians
-    dlat, dlon = r(lat2) - r(lat1), r(lon2) - r(lon1)
-    a = F.sin(dlat / 2) ** 2 + F.cos(r(lat1)) * F.cos(r(lat2)) * F.sin(dlon / 2) ** 2
-    return 2 * 6371.0 * F.asin(F.sqrt(a))
 
 
 def main():
@@ -96,48 +56,31 @@ def main():
     if d_from:
         bronze = bronze.where(F.col("date").between(F.lit(d_from), F.lit(d_to + timedelta(days=1))))
 
-    # 1. Tách mảng
-    withs = bronze.withColumn("arr", F.from_json(details_to_json_array(F.col("details_raw")), POINT_SCHEMA))
-    withs = withs.persist(StorageLevel.MEMORY_AND_DISK)
-    bad_rows = withs.filter(F.col("arr").isNull())
+    # 1. tách mảng (không persist details_raw, dễ OOM)
+    parsed = bronze.select("vehicle_code", "hour_key", parse_points(F.col("details_raw")).alias("arr"))
+    exploded = (parsed.select("vehicle_code", F.col("arr").isNull().alias("_bad_row"),
+                              F.explode_outer("arr").alias("p"))
+                .withColumn("_empty", F.col("p").isNull() & ~F.col("_bad_row")))  # mảng rỗng
 
-    pts = (withs.filter(F.col("arr").isNotNull())
-           .select("vehicle_code", "hour_key", F.explode("arr").alias("p")))
+    # 2-3. ẩn danh, sửa giờ
+    pts = exploded.select("_bad_row", "_empty", vehicle_key(args.salt, F.col("vehicle_code")).alias("vehicle_key"),
+                          "vehicle_code", *flatten_point("p"))
+    clock_fixed, gps_time = fix_clock(args.max_future_min)
+    pts = pts.select("*", clock_fixed, gps_time)
 
-    # 2–3. Ép kiểu, ẩn danh, sửa giờ thiết bị
-    pts = pts.select(
-        F.xxhash64(F.lit(args.salt), F.col("vehicle_code")).alias("vehicle_key"),
-        "vehicle_code",
-        F.to_timestamp("p.t0").alias("device_time"),
-        F.to_timestamp("p.t1").alias("recv_time"),
-        F.col("p.lt").alias("lat"),
-        F.col("p.ln").alias("lon"),
-        F.col("p.vl").alias("speed"),
-        F.col("p.km").alias("odometer"),
-        F.col("p.st").alias("status"),
-        F.col("p.ag").cast("int").alias("heading"),
-    )
-    skew_s = F.abs(F.col("recv_time").cast("long") - F.col("device_time").cast("long"))
-    clock_bad = F.col("device_time").isNull() | (skew_s > args.max_clock_skew_min * 60)
-    pts = (pts.withColumn("clock_fixed", clock_bad & F.col("recv_time").isNotNull())
-              .withColumn("gps_time", F.when(clock_bad, F.col("recv_time")).otherwise(F.col("device_time"))))
+    # 4. cách ly
+    pts = (pts.withColumn("reject_reason", reject_reason(args.max_speed, args.max_late_hours))
+              .persist(StorageLevel.DISK_ONLY))
+    bad_rows = pts.filter("_bad_row")
+    pts_ok = pts.filter(~F.col("_bad_row") & ~F.col("_empty"))
+    rejected = pts_ok.filter(F.col("reject_reason").isNotNull())
+    valid = pts_ok.filter(F.col("reject_reason").isNull())
 
-    # 4. Cách ly điểm lỗi
-    reason = (F.when(F.col("gps_time").isNull(), "missing_time")
-               .when(F.col("lat").isNull() | F.col("lon").isNull(), "missing_coord")
-               .when((F.col("lat") == 0) & (F.col("lon") == 0), "zero_coord")
-               .when(~F.col("lat").between(LAT_MIN, LAT_MAX) | ~F.col("lon").between(LON_MIN, LON_MAX),
-                     "outside_vietnam")
-               .when((F.col("speed") < 0) | (F.col("speed") > args.max_speed), "bad_speed"))
-    pts = pts.withColumn("reject_reason", reason).persist(StorageLevel.MEMORY_AND_DISK)
-    rejected = pts.filter(F.col("reject_reason").isNotNull())
-    valid = pts.filter(F.col("reject_reason").isNull())
-
-    # 5. Bỏ trùng
+    # 5. dedup
     w_dup = Window.partitionBy("vehicle_key", "gps_time").orderBy(F.col("recv_time").asc_nulls_last())
     deduped = valid.withColumn("_rn", F.row_number().over(w_dup)).filter("_rn = 1").drop("_rn")
 
-    # 6. Bỏ điểm nhảy
+    # 6. bỏ điểm nhảy
     w = Window.partitionBy("vehicle_key").orderBy("gps_time")
     j = deduped
     for side, fn in (("prev", F.lag), ("next", F.lead)):
@@ -153,13 +96,13 @@ def main():
     j = (j.withColumn("v_in", implied_kmh("prev"))
           .withColumn("v_out", implied_kmh("next"))
           .withColumn("is_jump", (F.col("v_in") > args.jump_speed) & (F.col("v_out") > args.jump_speed)))
-    j = j.persist(StorageLevel.MEMORY_AND_DISK)
+    j = j.persist(StorageLevel.DISK_ONLY)
     jumps = j.filter("is_jump")
 
     silver = (j.filter(~F.col("is_jump"))
                .withColumn("date", F.to_date("gps_time"))
                .select("vehicle_key", "date", "gps_time", "recv_time", "lat", "lon", "speed",
-                       "odometer", "status", "heading", "clock_fixed"))
+                       "odometer", "status", "heading", "clock_fixed", "provider", "address"))
     if d_from:
         silver = silver.where(F.col("date").between(F.lit(d_from), F.lit(d_to)))
 
@@ -171,7 +114,7 @@ def main():
         .partitionBy("date")
         .save(args.output))
 
-    # Ghi phần bị cách ly
+    # quarantine
     q_cols = ["vehicle_key", "gps_time", "recv_time", "lat", "lon", "speed", "reject_reason"]
     quarantine = (rejected.select(*q_cols)
                   .unionByName(jumps.withColumn("reject_reason", F.lit("gps_jump")).select(*q_cols))
@@ -180,12 +123,13 @@ def main():
     quarantine.write.format(args.format).mode("append").save(args.quarantine)
 
     if args.dim_output:
-        (pts.select("vehicle_key", "vehicle_code").distinct()
+        (pts_ok.select("vehicle_key", "vehicle_code").distinct()
             .write.mode("append").parquet(args.dim_output))
 
-    # ---- Báo cáo ----
-    expected = withs.agg(F.sum("total")).first()[0] or 0
-    exploded = pts.count()
+    # báo cáo
+    expected = bronze.agg(F.sum("total")).first()[0] or 0
+    n_bad_rows = bad_rows.count()
+    exploded = pts_ok.count()
     n_valid = valid.count()
     n_dedup = deduped.count()
     n_jump = jumps.count()
@@ -195,7 +139,7 @@ def main():
 
     print("=" * 60)
     print("SILVER – KẾT QUẢ" + (f" ({d_from} -> {d_to})" if d_from else ""))
-    print(f"  Dòng Bronze không tách được : {bad_rows.count():,}")
+    print(f"  Dòng Bronze không tách được : {n_bad_rows:,}")
     print(f"  Điểm theo cột Total         : {expected:,}")
     print(f"  Điểm tách được              : {exploded:,}"
           + ("" if exploded == expected else "   <-- KHÔNG KHỚP, cần kiểm tra"))
