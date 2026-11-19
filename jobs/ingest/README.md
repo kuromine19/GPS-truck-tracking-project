@@ -4,9 +4,29 @@
 |---|---|---|
 | `jobs/ingest/to_bronze.py` | Đọc file dump `.sql` → Bronze (1 dòng = 1 xe × 1 giờ, giữ nguyên mảng JSON) | container `spark-client` |
 | `jobs/ingest/to_silver.py` | Bronze → Silver (tách điểm, ẩn danh, sửa giờ, bỏ trùng, bỏ điểm lỗi) | container `spark-client` |
-| `jobs/ingest/export_sample.py` | Silver → bộ mẫu Parquet cho nhóm | container `spark-client` |
-| `scripts/generate_fake_dump.py` | Sinh dữ liệu giả lập đúng định dạng dump | máy (Ubuntu/WSL), chỉ cần Python |
-| `scripts/load_chunks.sh` | Nạp file dump lớn theo từng phần vào Bronze | máy (Ubuntu/WSL), gốc repo |
+| `jobs/common/gps_parse.py` | Đọc mảng điểm GPS + quy tắc làm sạch, **dùng chung với streaming** | (thư viện) |
+| `scripts/load_dumps_batched.sh` | Nạp dump PostgreSQL dạng nén (PGDMP) theo từng cụm vào Bronze | máy (Ubuntu/WSL), gốc repo |
+
+> `export_sample.py`, `generate_fake_dump.py`, `load_chunks.sh` đã bị xoá khỏi repo (commit `6390582`, `ddf36b6`,
+> `0dfebaa`); các mục "Việc 3" và "Nạp file dump lớn" bên dưới còn nhắc tới chúng là hướng dẫn cũ.
+> Lấy lại nếu cần: `git show 6390582^:jobs/ingest/export_sample.py`.
+
+## Dữ liệu thật khác với giả định ban đầu (khảo sát 20/11/2026)
+
+Mảng điểm trong cột `Details` dùng tên trường **`GPSTime, CreatedTime, Lat, Lng, SpeedMax, Heading, KM, Status,
+Temp, Desc, Note, CreatedBy, VehicleCode`** (không phải `t0, t1, lt, ln, vl, ...`). Chi tiết và cách xử lý từng
+trường: docstring của [`jobs/common/gps_parse.py`](../common/gps_parse.py). Điểm chính:
+
+- Phần tử mảng là JSON lồng 2 lớp thoát ký tự (`Note` chứa JSON `{Address, Fuel}`); bản cũ của `to_silver.py`
+  không tách được ~70% số dòng. Bản mới tách 100% (kiểm tra 2 giờ ngày 05/07/2022: 3.123.862 điểm, khớp cột `Total`).
+- Mọi dạng thời gian (`...`, `...+07:00`, `...Z`) đều là **giờ Việt Nam ghi sẵn** (khớp `hour_key` 100%).
+- `Desc` thường là biển số → bỏ. `CreatedBy` → chỉ giữ tên nhà cung cấp thiết bị (`provider`).
+- `Note.Address` có ở ~66% số điểm → cột `address` (gợi ý tỉnh mà không cần bản đồ ranh giới).
+- Tần suất ghi: khi chạy trung vị **10 s/điểm** (10%: 5 s, 90%: 31 s); khi đứng yên 30–60 s. Khác nhau theo nhà cung cấp.
+- ~23% điểm trùng `(xe, GPSTime)`.
+- ~10,6% điểm có `GPSTime` sớm hơn `CreatedTime` quá 1 giờ, trong đó ~8,3% (cũ hơn 72 giờ) đến từ ~12,6% số xe
+  gửi lặp "vị trí cuối còn nhớ" từ năm 2018–2020 → cách ly `stale_gps`; phần còn lại là gửi bù sau mất sóng.
+- Vận tốc: trung vị 0, p90 49, p99 64, p99,9 77, lớn nhất 147 km/h.
 
 Các lệnh `docker compose` chạy trong thư mục `infra/`. Các lệnh `python3` chạy ở **gốc repo**.
 
@@ -43,8 +63,8 @@ Job làm lần lượt:
 
 | Bước | Quy tắc mặc định | Đổi bằng |
 |---|---|---|
-| Sửa giờ thiết bị sai | `t0` lệch `t1` quá 60 phút → dùng `t1`, gắn `clock_fixed = true` | `--max-clock-skew-min` |
-| Cách ly điểm lỗi | Thiếu thời gian, tọa độ rỗng hoặc (0,0), ngoài Việt Nam, vận tốc âm hoặc > 200 km/h | `--max-speed` |
+| Sửa giờ thiết bị sai | `GPSTime` muộn hơn `CreatedTime` quá 5 phút → dùng `CreatedTime`, gắn `clock_fixed = true` | `--max-future-min` |
+| Cách ly điểm lỗi | Thiếu thời gian; **vị trí cũ** (`GPSTime` sớm hơn `CreatedTime` quá 72 giờ – thiết bị mất định vị gửi lặp vị trí cũ từ nhiều năm trước, ~8% số điểm); tọa độ rỗng hoặc (0,0); ngoài Việt Nam; vận tốc âm hoặc > 200 km/h | `--max-late-hours`, `--max-speed` |
 | Bỏ trùng | Cùng xe + cùng `gps_time` → giữ lần server nhận sớm nhất | |
 | Bỏ điểm nhảy | Vận tốc suy ra từ điểm trước **và** điểm sau đều > 150 km/h | `--jump-speed` |
 
@@ -63,14 +83,16 @@ Muốn lưu bảng đối chiếu `vehicle_key ↔ mã xe` (chứa biển số t
 |---|---|---|
 | `vehicle_key` | bigint | `xxhash64(VEHICLE_KEY_SALT, mã xe)` |
 | `date` | date | ngày của `gps_time` – cột chia thư mục |
-| `gps_time` | timestamp | từ `t0` (đã sửa nếu giờ thiết bị sai) |
-| `recv_time` | timestamp | từ `t1` |
-| `lat`, `lon` | double | |
-| `speed` | double | từ `vl` |
-| `odometer` | double | từ `km` |
-| `status` | int | từ `st` |
-| `heading` | int | từ `ag` |
-| `clock_fixed` | boolean | `true` nếu `gps_time` đã thay bằng `t1` |
+| `gps_time` | timestamp | từ `GPSTime` (đã sửa nếu giờ thiết bị sai) |
+| `recv_time` | timestamp | từ `CreatedTime` |
+| `lat`, `lon` | double | từ `Lat`, `Lng` |
+| `speed` | double | từ `SpeedMax` (km/h) |
+| `odometer` | double | từ `KM` (nhà cung cấp khác nhau dùng khác nhau) |
+| `status` | bigint | từ `Status` (cờ bit, chưa có bảng mã) |
+| `heading` | int | từ `Heading` |
+| `clock_fixed` | boolean | `true` nếu `gps_time` đã thay bằng `CreatedTime` |
+| `provider` | string | nhà cung cấp thiết bị, từ `CreatedBy` |
+| `address` | string | từ `Note.Address` (null nếu không có) |
 
 ## Việc 3 – Dữ liệu giả lập + bộ mẫu
 

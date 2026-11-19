@@ -11,7 +11,9 @@ Kiến trúc, câu hỏi nghiên cứu và phân công: [`docs/frame_phan_cong.m
 | Thư mục | Nội dung | Phụ trách |
 |---|---|---|
 | `infra/` | Docker Compose: MinIO, Spark, Kafka, Elasticsearch/Kibana, Airflow | Bách Hợp |
-| `jobs/ingest/` | Đọc file dump → Bronze → Silver, xuất bộ mẫu | Đạt |
+| `jobs/ingest/` | Đọc file dump → Bronze → Silver | Đạt |
+| `jobs/streaming/` | Phát lại dump vào Kafka, Spark Structured Streaming, đẩy Elasticsearch | Đạt |
+| `jobs/common/` | Hàm đọc/làm sạch điểm GPS dùng chung cho batch và streaming | |
 | `jobs/gold/` | Bảng tổng hợp Gold | Thảo Trang |
 | `dags/` | DAG Airflow | người viết job tương ứng |
 | `scripts/` | Script chạy trên máy (sinh dữ liệu giả lập, ...) | |
@@ -33,6 +35,7 @@ make smoke      # kiểm tra
 ```
 
 Chi tiết hạ tầng: [`infra/README.md`](infra/README.md) · Chạy ingestion: [`jobs/ingest/README.md`](jobs/ingest/README.md)
+· Streaming: [`jobs/streaming/README.md`](jobs/streaming/README.md) · Tiến độ: [`docs/tien_do.md`](docs/tien_do.md)
 
 ## Quy tắc làm việc
 
