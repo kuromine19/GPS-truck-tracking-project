@@ -63,7 +63,8 @@ def main():
            .withColumn("recv_hour", F.date_format("recv_ts", "yyyyMMddHH")))
 
     # mỗi giờ 1 file, sort theo recv_ts
-    (pts.repartition("recv_hour").sortWithinPartitions("recv_ts")
+    # sort cả recv_hour để Spark không sort lại khi partitionBy (mất thứ tự recv_ts)
+    (pts.repartition("recv_hour").sortWithinPartitions("recv_hour", "recv_ts")
         .write.mode("overwrite").partitionBy("recv_hour").parquet(out))
 
     res = spark.read.parquet(out)
